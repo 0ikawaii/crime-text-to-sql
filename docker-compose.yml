@@ -1,0 +1,160 @@
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    container_name: crime_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: crime_user
+      POSTGRES_PASSWORD: crime_pass
+      POSTGRES_DB: crime_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./sql/schema.sql:/docker-entrypoint-initdb.d/01_schema.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U crime_user -d crime_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # --- Airflow's own metadata database (separate from crime_db above) ---
+  airflow-db:
+    image: postgres:16
+    container_name: airflow_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - airflow_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow -d airflow"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # --- One-time init: creates Airflow's DB schema and admin user ---
+  airflow-init:
+    image: apache/airflow:2.10.3
+    container_name: airflow_init
+    depends_on:
+      airflow-db:
+        condition: service_healthy
+    environment:
+      &airflow-common-env
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-db/airflow
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      # Must be identical across webserver/scheduler/triggerer or log-fetching
+      # between components fails with 403 Forbidden. Fine as a fixed dev
+      # value here; for anything beyond local learning, generate a real
+      # secret and keep it out of version control.
+      AIRFLOW__WEBSERVER__SECRET_KEY: "dev_only_shared_secret_change_me"
+      # Overrides .env's DB_HOST=localhost for scripts run inside this
+      # container. Docker containers reach each other by service name (the
+      # 'db' service below), not localhost — localhost inside a container
+      # means the container itself. python-dotenv's load_dotenv() does not
+      # override already-set environment variables by default, so this wins.
+      DB_HOST: db
+      # sqlalchemy IS pinned here, deliberately, to 1.4.51 — the newest 1.4.x
+      # release. This threads a real needle: pandas 2.2.3's to_sql() needs
+      # SQLAlchemy >=1.4.36 to reliably recognize an Engine/Connection object
+      # (older versions cause a confusing 'Connection has no attribute
+      # cursor' AttributeError). But SQLAlchemy 2.0.x breaks Airflow 2.10.3's
+      # own ORM models (TaskInstance etc. use a declarative style incompatible
+      # with 2.0's annotation-based mapping). 1.4.51 satisfies both.
+      # psycopg2-binary is NOT pinned — Airflow's postgres provider already
+      # ships a compatible driver.
+      _PIP_ADDITIONAL_REQUIREMENTS: "pandas==2.2.3 pyarrow==17.0.0 requests==2.32.3 python-dotenv==1.0.1 sqlalchemy==1.4.51"
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./scripts:/opt/airflow/project_scripts
+      - ./data:/opt/airflow/project_data
+      - ./.env:/opt/airflow/.env
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        airflow db migrate
+        airflow users create \
+          --username admin \
+          --password admin \
+          --firstname Admin \
+          --lastname User \
+          --role Admin \
+          --email admin@example.com || true
+
+  airflow-webserver:
+    image: apache/airflow:2.10.3
+    container_name: airflow_webserver
+    restart: unless-stopped
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    environment: *airflow-common-env
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./scripts:/opt/airflow/project_scripts
+      - ./data:/opt/airflow/project_data
+      - ./.env:/opt/airflow/.env
+    ports:
+      - "8081:8080"
+    command: webserver
+
+  airflow-scheduler:
+    image: apache/airflow:2.10.3
+    container_name: airflow_scheduler
+    restart: unless-stopped
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    environment: *airflow-common-env
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./scripts:/opt/airflow/project_scripts
+      - ./data:/opt/airflow/project_data
+      - ./.env:/opt/airflow/.env
+    command: scheduler
+
+  # --- Step 9: containerize the FastAPI + Streamlit layers too ---
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    container_name: crime_api
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      # Overrides .env's DB_HOST=localhost — this container reaches Postgres
+      # by the 'db' service name, same reasoning as the Airflow containers.
+      DB_HOST: db
+    ports:
+      - "8000:8000"
+
+  # --- Step 9b: Vue frontend replacing Streamlit ---
+  # This is a browser-side app (unlike Streamlit, which ran server-side), so
+  # VITE_API_URL must be an address reachable from the USER'S BROWSER
+  # (localhost:8000), not the Docker-internal service name 'api'. It's baked
+  # in at build time since Vite produces static JS shipped to the browser.
+  frontend:
+    build:
+      context: ./crime-frontend
+      dockerfile: Dockerfile
+      args:
+        VITE_API_URL: http://localhost:8000
+    container_name: crime_frontend
+    restart: unless-stopped
+    depends_on:
+      - api
+    ports:
+      - "5173:80"
+
+volumes:
+  pgdata:
+  airflow_pgdata:

@@ -1,0 +1,11 @@
+pandas==2.2.3
+pyarrow==17.0.0
+sqlalchemy==2.0.36
+psycopg2-binary==2.9.10
+python-dotenv==1.0.1
+requests==2.32.3
+anthropic==0.117.0
+sqlglot==30.12.0
+sentence-transformers
+fastapi==0.139.2
+uvicorn==0.51.0
