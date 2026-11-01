@@ -8,6 +8,13 @@
 -- floats) — that's expected, not a mistake.
 -- ============================================================================
 
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'llm_readonly') THEN
+    CREATE ROLE llm_readonly LOGIN PASSWORD 'llm_pass_dev_only';
+  END IF;
+END $$;
+ALTER ROLE llm_readonly SET statement_timeout = '5s';
+
 CREATE EXTENSION IF NOT EXISTS vector;
 
 -- Crimes by district, category, and type (Royal Malaysian Police data via DOSM)
@@ -109,3 +116,5 @@ CREATE INDEX IF NOT EXISTS idx_glossary_embedding
 -- Read-only role needs SELECT on these too (the loader/embedding script uses
 -- crime_user to INSERT; the running app only ever needs to SELECT from them).
 GRANT SELECT ON few_shot_examples, schema_glossary TO llm_readonly;
+
+GRANT SELECT ON crime_district, income_district, population_district TO llm_readonly;
